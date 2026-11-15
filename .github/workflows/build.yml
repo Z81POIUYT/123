@@ -1,0 +1,324 @@
+name: Build ShawarmaEvents plugin
+
+# Builds the probe plugin in the cloud against the YYToolkit v5.0.0c sources.
+# Runs automatically when this file is committed, and can be re-run from the Actions tab.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      _CL_: /std:c++latest
+    steps:
+      - name: Get YYToolkit source (same version as the installed YYToolkit.dll)
+        shell: bash
+        run: |
+          git clone https://github.com/AurieFramework/YYToolkit.git yytk
+          cd yytk
+          echo "--- v5 tags:"
+          git tag -l "v5*"
+          if git rev-parse -q --verify "refs/tags/v5.0.0c" > /dev/null; then
+            git checkout -q v5.0.0c
+            echo "Using tag v5.0.0c"
+          else
+            echo "WARNING: tag v5.0.0c not found, using the default branch"
+          fi
+          git submodule update --init --recursive || true
+          git log -1 --oneline
+          ls -la
+          ls -la ExamplePlugin
+
+      - name: Write the plugin source into the ExamplePlugin project
+        shell: pwsh
+        run: |
+          $cands = Get-ChildItem yytk/ExamplePlugin -Filter *.cpp -Recurse
+          $ex = $cands | Where-Object { (Get-Content $_.FullName -Raw) -match 'EXPORTED\s+AurieStatus\s+ModuleInitialize' } | Select-Object -First 1
+          if (-not $ex) { $ex = $cands | Where-Object { (Get-Content $_.FullName -Raw) -match 'ModuleInitialize\s*\(' } | Select-Object -First 1 }
+          if (-not $ex) { throw "No ExamplePlugin source containing ModuleInitialize was found" }
+          Write-Host "Replacing: $($ex.FullName)"
+          $head = @(Get-Content $ex.FullName | Where-Object { $_ -match '^\s*(#include|using namespace)' })
+          Write-Host "---- includes kept from the original file:"
+          $head | ForEach-Object { Write-Host $_ }
+          $body = @'
+          // ======================================================================
+          // Shawarma Legend event probe (YYToolkit v5 plugin). ASCII only on purpose.
+          // Logs object events (Create / Alarm / Other / Step ...) of the objects listed in
+          // shawarma_watch.txt, plus F7 / F8 / F9 key marks, to shawarma_events.log.
+          // ======================================================================
+          #if __has_include(<Windows.h>)
+          #include <Windows.h>
+          #endif
+          #include <chrono>
+          #include <cstdio>
+          #include <cstring>
+          #include <filesystem>
+          #include <fstream>
+          #include <string>
+          #include <tuple>
+          #include <unordered_map>
+          #include <vector>
+
+          using namespace Aurie;
+          using namespace YYTK;
+
+          namespace sl
+          {
+              struct State
+              {
+                  std::ofstream log;
+                  std::vector<std::string> watch;
+                  bool watch_all = false;
+                  LARGE_INTEGER freq{};
+                  LARGE_INTEGER t0{};
+                  std::unordered_map<std::string, double> last_noisy;
+                  ULONGLONG last_key_tick = 0;
+                  bool key_down[3] = { false, false, false };
+              };
+
+              State* g = nullptr; // allocated in ModuleInitialize, never freed (process lifetime)
+
+              double NowMs()
+              {
+                  LARGE_INTEGER t{};
+                  QueryPerformanceCounter(&t);
+                  return double(t.QuadPart - g->t0.QuadPart) * 1000.0 / double(g->freq.QuadPart);
+              }
+
+              void Write(const char* kind, const char* name, const void* ptr, double now)
+              {
+                  char buf[600];
+                  int n = std::snprintf(buf, sizeof(buf), "%.1f\t%s\t%s\t%p\n", now, kind, name, ptr);
+                  if (n > 0 && g->log.is_open())
+                  {
+                      g->log.write(buf, n);
+                      g->log.flush();
+                  }
+              }
+
+              // The code-entry name accessor differs between YYToolkit versions: detect it at compile time.
+              template <typename T>
+              const char* CodeName(T* code)
+              {
+                  if constexpr (requires { code->GetName(); })
+                      return code->GetName();
+                  else if constexpr (requires { code->i_pName; })
+                      return code->i_pName;
+                  else
+                      return nullptr;
+              }
+
+              bool IsNoisy(const char* name)
+              {
+                  return std::strstr(name, "_Step_") != nullptr || std::strstr(name, "_Draw_") != nullptr;
+              }
+
+              void PollKeys()
+              {
+                  ULONGLONG tick = GetTickCount64();
+                  if (tick - g->last_key_tick < 30)
+                      return;
+                  g->last_key_tick = tick;
+
+                  static const int keys[3] = { VK_F7, VK_F8, VK_F9 };
+                  static const char* labels[3] = { "F7", "F8", "F9" };
+                  for (int i = 0; i < 3; ++i)
+                  {
+                      bool down = (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
+                      if (down && !g->key_down[i])
+                          Write("MARK", labels[i], nullptr, NowMs());
+                      g->key_down[i] = down;
+                  }
+              }
+
+              void OnObjectEvent(FWCodeEvent& Event)
+              {
+                  if (!g)
+                      return;
+                  try
+                  {
+                      auto&& args = Event.Arguments();
+                      CInstance* self = std::get<0>(args);
+                      CCode* code = std::get<2>(args);
+                      if (!code)
+                          return;
+
+                      PollKeys();
+
+                      const char* name = CodeName(code);
+                      if (!name || std::strncmp(name, "gml_Object_", 11) != 0)
+                          return;
+                      name += 11; // strip the common prefix
+
+                      bool hit = g->watch_all;
+                      if (!hit)
+                      {
+                          for (const auto& w : g->watch)
+                          {
+                              if (std::strstr(name, w.c_str()) != nullptr)
+                              {
+                                  hit = true;
+                                  break;
+                              }
+                          }
+                      }
+                      if (!hit)
+                          return;
+
+                      double now = NowMs();
+                      if (IsNoisy(name))
+                      {
+                          // Step / Draw events fire every frame: log at most once per second per instance.
+                          char keybuf[300];
+                          std::snprintf(keybuf, sizeof(keybuf), "%s@%p", name, static_cast<const void*>(self));
+                          std::string key(keybuf);
+                          auto it = g->last_noisy.find(key);
+                          if (it != g->last_noisy.end() && now - it->second < 1000.0)
+                              return;
+                          if (g->last_noisy.size() > 4000)
+                              g->last_noisy.clear();
+                          g->last_noisy[key] = now;
+                      }
+                      Write("EVT", name, static_cast<const void*>(self), now);
+                  }
+                  catch (...)
+                  {
+                      // never let an exception escape into the game
+                  }
+              }
+
+              void LoadWatch(const std::filesystem::path& dir)
+              {
+                  static const char* defaults[] = {
+                      "obj_zbon", "obj_anger", "obj_order", "obj_sandwich", "obj_sandwitch",
+                      "obj_thief", "obj_coin", "obj_rate", "obj_timeout", "obj_you_are"
+                  };
+
+                  std::filesystem::path path = dir / "shawarma_watch.txt";
+                  std::ifstream in(path);
+                  if (in.is_open())
+                  {
+                      std::string line;
+                      while (std::getline(in, line))
+                      {
+                          while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+                              line.pop_back();
+                          size_t start = 0;
+                          while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+                              ++start;
+                          line = line.substr(start);
+                          if (line.empty() || line[0] == '#')
+                              continue;
+                          if (line == "ALL")
+                              g->watch_all = true;
+                          else
+                              g->watch.push_back(line);
+                      }
+                  }
+                  else
+                  {
+                      std::ofstream out(path);
+                      if (out.is_open())
+                      {
+                          out << "# One keyword per line. An event is logged when its name contains the keyword.\n";
+                          out << "# Example event name: obj_zbon_Create_0 (object obj_zbon, Create event).\n";
+                          for (const char* d : defaults)
+                              out << d << "\n";
+                          out << "# Remove the # in front of ALL to log every object (the log gets huge).\n";
+                          out << "# ALL\n";
+                      }
+                  }
+
+                  if (g->watch.empty() && !g->watch_all)
+                  {
+                      for (const char* d : defaults)
+                          g->watch.push_back(d);
+                  }
+              }
+          }
+
+          EXPORTED AurieStatus ModuleInitialize(
+              IN AurieModule* Module,
+              IN const std::filesystem::path& ModulePath
+          )
+          {
+              auto* yytk = YYTK::GetInterface();
+              if (!yytk)
+                  return AURIE_MODULE_DEPENDENCY_NOT_RESOLVED;
+
+              sl::g = new sl::State();
+              QueryPerformanceFrequency(&sl::g->freq);
+              QueryPerformanceCounter(&sl::g->t0);
+
+              std::filesystem::path dir = ModulePath.parent_path();
+              sl::LoadWatch(dir);
+              sl::g->log.open(dir / "shawarma_events.log", std::ios::app);
+
+              SYSTEMTIME st{};
+              GetLocalTime(&st);
+              char header[200];
+              std::snprintf(header, sizeof(header), "# session start %04d-%02d-%02d %02d:%02d:%02d, keys: F7 F8 F9 write MARK lines\n",
+                  int(st.wYear), int(st.wMonth), int(st.wDay), int(st.wHour), int(st.wMinute), int(st.wSecond));
+              if (sl::g->log.is_open())
+              {
+                  sl::g->log << header;
+                  sl::g->log.flush();
+              }
+
+              AurieStatus status = yytk->CreateCallback(
+                  Module,
+                  EVENT_OBJECT_CALL,
+                  reinterpret_cast<PVOID>(&sl::OnObjectEvent),
+                  0
+              );
+              if (status != AURIE_SUCCESS && sl::g->log.is_open())
+              {
+                  sl::g->log << "# CreateCallback failed\n";
+                  sl::g->log.flush();
+              }
+              return status;
+          }
+          '@
+          Set-Content -Path $ex.FullName -Value ($head + $body) -Encoding utf8
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $start = Get-Date
+          New-Item out -ItemType Directory -Force | Out-Null
+          $sln = Get-ChildItem yytk -Filter *.sln -Depth 1 | Select-Object -First 1
+          $proj = Get-ChildItem yytk/ExamplePlugin -Filter *.vcxproj -Recurse | Select-Object -First 1
+          if (-not $proj) { throw "No ExamplePlugin .vcxproj found" }
+          Write-Host "solution: $($sln.FullName)"
+          Write-Host "project:  $($proj.FullName)"
+          $attempts = @()
+          if ($sln) { $attempts += ,@($sln.FullName, "/t:ExamplePlugin", "/p:Configuration=Release", "/p:Platform=x64") }
+          $attempts += ,@($proj.FullName, "/p:Configuration=Release", "/p:Platform=x64")
+          $attempts += ,@($proj.FullName, "/p:Configuration=Release")
+          $ok = $false
+          $i = 0
+          foreach ($a in $attempts) {
+            $i++
+            Write-Host "=== attempt ${i}: msbuild $($a -join ' ')"
+            & msbuild @a /m /nologo /v:minimal *> "out/build_attempt_${i}.log"
+            Get-Content "out/build_attempt_${i}.log" -Tail 40 | Write-Host
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+          }
+          if (-not $ok) { Write-Host "ALL BUILD ATTEMPTS FAILED"; exit 1 }
+          $dlls = @(Get-ChildItem yytk -Recurse -Filter *.dll | Where-Object { $_.LastWriteTime -gt $start })
+          $dlls | ForEach-Object { Write-Host "new dll: $($_.FullName)" }
+          $main = $dlls | Where-Object { $_.FullName -match 'ExamplePlugin' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $main) { $main = $dlls | Sort-Object LastWriteTime -Descending | Select-Object -First 1 }
+          if (-not $main) { throw "Build succeeded but no new DLL was found" }
+          Copy-Item $main.FullName out/ShawarmaEvents.dll
+          Write-Host "Built: $($main.FullName)"
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShawarmaEvents
+          path: out
