@@ -238,21 +238,67 @@ jobs:
               }
           }
 
+          namespace sl
+          {
+              // Try to fetch the YYToolkit interface by name through Aurie. Only compiled in if the call is valid for this Aurie version.
+              template <typename TBase>
+              bool TryGetByName(const char* name, TBase*& out, int& status_code)
+              {
+                  if constexpr (requires { ObGetInterface(name, out); })
+                  {
+                      status_code = static_cast<int>(ObGetInterface(name, out));
+                      return status_code == static_cast<int>(AURIE_SUCCESS) && out != nullptr;
+                  }
+                  else
+                  {
+                      status_code = -1;
+                      return false;
+                  }
+              }
+
+              YYTKInterface* AcquireInterface()
+              {
+                  auto note = [](const std::string& text)
+                  {
+                      if (g && g->log.is_open())
+                      {
+                          g->log << "# " << text << "\n";
+                          g->log.flush();
+                      }
+                  };
+
+                  // 1) the documented v5 way
+                  YYTKInterface* iface = YYTK::GetInterface();
+                  note(iface ? "interface: YYTK::GetInterface() ok" : "interface: YYTK::GetInterface() returned nullptr");
+                  if (iface)
+                      return iface;
+
+                  // 2) by name (the v5 preview registers itself as YYTK_ZeusMain)
+                  static const char* names[] = { "YYTK_ZeusMain", "YYTK_Main" };
+                  for (const char* n : names)
+                  {
+                      AurieInterfaceBase* base = nullptr;
+                      int code = 0;
+                      bool ok = TryGetByName(n, base, code);
+                      note(std::string("interface: ObGetInterface(") + n + ") status=" + std::to_string(code) + (ok ? " ok" : " failed"));
+                      if (ok)
+                          return reinterpret_cast<YYTKInterface*>(base);
+                  }
+                  return nullptr;
+              }
+          }
+
           EXPORTED AurieStatus ModuleInitialize(
               IN AurieModule* Module,
               IN const std::filesystem::path& ModulePath
           )
           {
-              auto* yytk = YYTK::GetInterface();
-              if (!yytk)
-                  return AURIE_MODULE_DEPENDENCY_NOT_RESOLVED;
-
               sl::g = new sl::State();
               QueryPerformanceFrequency(&sl::g->freq);
               QueryPerformanceCounter(&sl::g->t0);
 
+              // Open the log first, so that we can always see what happened (even when something fails below).
               std::filesystem::path dir = ModulePath.parent_path();
-              sl::LoadWatch(dir);
               sl::g->log.open(dir / "shawarma_events.log", std::ios::app);
 
               SYSTEMTIME st{};
@@ -262,8 +308,21 @@ jobs:
                   int(st.wYear), int(st.wMonth), int(st.wDay), int(st.wHour), int(st.wMinute), int(st.wSecond));
               if (sl::g->log.is_open())
               {
-                  sl::g->log << header;
+                  sl::g->log << header << "# ModuleInitialize entered\n";
                   sl::g->log.flush();
+              }
+
+              sl::LoadWatch(dir);
+
+              YYTKInterface* yytk = sl::AcquireInterface();
+              if (!yytk)
+              {
+                  if (sl::g->log.is_open())
+                  {
+                      sl::g->log << "# FATAL: could not get the YYToolkit interface\n";
+                      sl::g->log.flush();
+                  }
+                  return AURIE_MODULE_DEPENDENCY_NOT_RESOLVED;
               }
 
               AurieStatus status = yytk->CreateCallback(
@@ -272,15 +331,25 @@ jobs:
                   reinterpret_cast<PVOID>(&sl::OnObjectEvent),
                   0
               );
-              if (status != AURIE_SUCCESS && sl::g->log.is_open())
+              if (sl::g->log.is_open())
               {
-                  sl::g->log << "# CreateCallback failed\n";
+                  sl::g->log << "# CreateCallback(EVENT_OBJECT_CALL) status=" << static_cast<int>(status) << "\n";
                   sl::g->log.flush();
               }
               return status;
           }
           '@
           Set-Content -Path $ex.FullName -Value ($head + $body) -Encoding utf8
+
+      - name: Collect header info (for troubleshooting)
+        shell: pwsh
+        run: |
+          New-Item out -ItemType Directory -Force | Out-Null
+          $info = "out/header_info.txt"
+          "commit: $(git -C yytk log -1 --format=%H)" | Out-File $info
+          $files = Get-ChildItem yytk/ExamplePlugin, yytk/YYToolkit/source/YYTK/Shared -Recurse -Include *.hpp,*.h,*.cpp -ErrorAction SilentlyContinue
+          $files | Select-String -Pattern 'GetInterface|YYTK_Zeus|"YYTK_' | ForEach-Object { "$($_.Path):$($_.LineNumber): $($_.Line.Trim())" } | Out-File $info -Append
+          Get-Content $info | Select-Object -First 40 | Write-Host
 
       - uses: microsoft/setup-msbuild@v2
 
