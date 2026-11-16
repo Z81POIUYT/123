@@ -597,6 +597,50 @@ jobs:
           name: ShawarmaEvents-${{ matrix.name }}
           path: out
 
+  pdb:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download the PDB (debug symbols) that belongs to the installed YYToolkit.dll
+        shell: bash
+        run: |
+          mkdir -p pdb pdb_info
+          gh release download v5.0.0c --repo AurieFramework/YYToolkit --pattern "YYToolkit.pdb" --dir pdb
+          ls -la pdb
+
+      - name: Install LLVM tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq llvm
+          ls -la /usr/lib/llvm-*/bin/llvm-pdbutil || true
+
+      - name: Dump the real interface layout from the PDB
+        shell: bash
+        run: |
+          T=$(ls /usr/lib/llvm-*/bin/llvm-pdbutil 2>/dev/null | tail -1)
+          echo "tool: $T" | tee pdb_info/tool_info.txt
+          "$T" dump -types pdb/YYToolkit.pdb > types_all.txt 2> pdb_info/dump_stderr.txt || true
+          ls -la types_all.txt | tee -a pdb_info/tool_info.txt
+          wc -l types_all.txt | tee -a pdb_info/tool_info.txt
+          {
+            for pat in 'name = `CreateCallback`' 'EVENT_OBJECT_CALL' 'FWCodeEvent' 'YYTK::CCode`' 'YYTK::YYTKInterface`' 'AurieInterfaceBase`'; do
+              echo "################ $pat"
+              grep -n -F -m 3 -B 70 -A 70 -- "$pat" types_all.txt | head -450
+            done
+          } > pdb_info/pdb_grep.txt 2>&1 || true
+          "$T" pretty -classes -enums -class-definitions=all -include='YYTKInterface|FWCodeEvent|CCode$|EventTriggers|AurieInterfaceBase' pdb/YYToolkit.pdb > pdb_info/pdb_pretty.txt 2>&1 || true
+          gzip -9 -c types_all.txt > pdb_info/types_all.txt.gz || true
+          ls -la pdb_info
+
+      - name: Upload PDB info
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShawarmaEvents-pdb-info
+          path: pdb_info
+
   collect:
     needs: build
     if: always()
