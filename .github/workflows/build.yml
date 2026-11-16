@@ -1,6 +1,6 @@
 name: Build ShawarmaEvents plugin
 
-# Builds the probe plugin in the cloud against the YYToolkit v5.0.0c sources.
+# Builds the probe plugin in the cloud against YYToolkit v5.0.0c and Aurie v2.0.2 (the versions installed in the game).
 # Runs automatically when this file is committed, and can be re-run from the Actions tab.
 on:
   push:
@@ -30,6 +30,15 @@ jobs:
           ls -la
           ls -la ExamplePlugin
 
+      - name: Get Aurie source (v2.0.2, same version as the installed AurieCore.dll)
+        shell: bash
+        run: |
+          git clone --depth 1 --branch v2.0.2 https://github.com/AurieFramework/Aurie.git aurie
+          cd aurie
+          git log -1 --oneline
+          echo "--- shared files in Aurie:"
+          find . -iname "shared*" | head -40
+
       - name: Write the plugin source into the ExamplePlugin project
         shell: pwsh
         run: |
@@ -43,7 +52,7 @@ jobs:
           $head | ForEach-Object { Write-Host $_ }
           $body = @'
           // ======================================================================
-          // Shawarma Legend event probe (YYToolkit v5 plugin). ASCII only on purpose.
+          // Shawarma Legend event probe (YYToolkit v5 plugin), v3. ASCII only on purpose.
           // Logs object events (Create / Alarm / Other / Step ...) of the objects listed in
           // shawarma_watch.txt, plus F7 / F8 / F9 key marks, to shawarma_events.log.
           // ======================================================================
@@ -58,6 +67,7 @@ jobs:
           #include <string>
           #include <tuple>
           #include <unordered_map>
+          #include <unordered_set>
           #include <vector>
 
           using namespace Aurie;
@@ -70,11 +80,17 @@ jobs:
                   std::ofstream log;
                   std::vector<std::string> watch;
                   bool watch_all = false;
+                  bool disabled = false;
                   LARGE_INTEGER freq{};
                   LARGE_INTEGER t0{};
                   std::unordered_map<std::string, double> last_noisy;
                   ULONGLONG last_key_tick = 0;
+                  ULONGLONG last_stat_tick = 0;
                   bool key_down[3] = { false, false, false };
+                  unsigned long long events_seen = 0;
+                  unsigned long long events_logged = 0;
+                  std::unordered_set<std::string> raw_seen; // distinct event names seen so far (inventory, first 80)
+                  int faults = 0;
               };
 
               State* g = nullptr; // allocated in ModuleInitialize, never freed (process lifetime)
@@ -84,6 +100,15 @@ jobs:
                   LARGE_INTEGER t{};
                   QueryPerformanceCounter(&t);
                   return double(t.QuadPart - g->t0.QuadPart) * 1000.0 / double(g->freq.QuadPart);
+              }
+
+              void Note(const char* text)
+              {
+                  if (g && g->log.is_open())
+                  {
+                      g->log << "# " << text << "\n";
+                      g->log.flush();
+                  }
               }
 
               void Write(const char* kind, const char* name, const void* ptr, double now)
@@ -109,6 +134,35 @@ jobs:
                       return nullptr;
               }
 
+              bool CopyNameUnsafe(CCode* code, char* out, size_t cap)
+              {
+                  const char* n = CodeName(code);
+                  if (!n)
+                      return false;
+                  size_t i = 0;
+                  for (; i + 1 < cap && n[i] != '\0'; ++i)
+                      out[i] = n[i];
+                  out[i] = '\0';
+                  return true;
+              }
+
+              // Copies the code name into a local buffer. A bad pointer must never take the game down.
+              bool CopyName(CCode* code, char* out, size_t cap)
+              {
+          #if defined(_MSC_VER)
+                  __try
+                  {
+                      return CopyNameUnsafe(code, out, cap);
+                  }
+                  __except (EXCEPTION_EXECUTE_HANDLER)
+                  {
+                      return false;
+                  }
+          #else
+                  return CopyNameUnsafe(code, out, cap);
+          #endif
+              }
+
               bool IsNoisy(const char* name)
               {
                   return std::strstr(name, "_Step_") != nullptr || std::strstr(name, "_Draw_") != nullptr;
@@ -132,60 +186,166 @@ jobs:
                   }
               }
 
-              void OnObjectEvent(FWCodeEvent& Event)
+              void OnObjectEventInner(FWCodeEvent& Event)
+              {
+                  auto&& args = Event.Arguments();
+                  CInstance* self = std::get<0>(args);
+                  CCode* code = std::get<2>(args);
+                  if (!code)
+                      return;
+
+                  g->events_seen++;
+                  PollKeys();
+
+                  char namebuf[256];
+                  if (!CopyName(code, namebuf, sizeof(namebuf)))
+                      return;
+
+                  ULONGLONG tick = GetTickCount64();
+                  if (g->last_stat_tick == 0 || tick - g->last_stat_tick >= 10000)
+                  {
+                      g->last_stat_tick = tick;
+                      char stat[120];
+                      std::snprintf(stat, sizeof(stat), "events_seen=%llu logged=%llu", g->events_seen, g->events_logged);
+                      Write("STAT", stat, nullptr, NowMs());
+                  }
+
+                  if (g->raw_seen.size() < 80 && g->raw_seen.insert(namebuf).second)
+                      Write("RAW", namebuf, static_cast<const void*>(self), NowMs());
+
+                  if (std::strncmp(namebuf, "gml_Object_", 11) != 0)
+                      return;
+                  const char* name = namebuf + 11; // strip the common prefix
+
+                  bool hit = g->watch_all;
+                  if (!hit)
+                  {
+                      for (const auto& w : g->watch)
+                      {
+                          if (std::strstr(name, w.c_str()) != nullptr)
+                          {
+                              hit = true;
+                              break;
+                          }
+                      }
+                  }
+                  if (!hit)
+                      return;
+
+                  double now = NowMs();
+                  if (IsNoisy(name))
+                  {
+                      // Step / Draw events fire every frame: log at most once per second per instance.
+                      char keybuf[300];
+                      std::snprintf(keybuf, sizeof(keybuf), "%s@%p", name, static_cast<const void*>(self));
+                      std::string key(keybuf);
+                      auto it = g->last_noisy.find(key);
+                      if (it != g->last_noisy.end() && now - it->second < 1000.0)
+                          return;
+                      if (g->last_noisy.size() > 4000)
+                          g->last_noisy.clear();
+                      g->last_noisy[key] = now;
+                  }
+                  g->events_logged++;
+                  Write("EVT", name, static_cast<const void*>(self), now);
+              }
+
+              void OnFault()
               {
                   if (!g)
                       return;
+                  g->faults++;
+                  char text[100];
+                  std::snprintf(text, sizeof(text), "FAULT in event callback (#%d)", g->faults);
+                  Note(text);
+                  if (g->faults >= 3)
+                  {
+                      g->disabled = true;
+                      Note("callback disabled after 3 faults");
+                  }
+              }
+
+              // Entry point called by YYToolkit for every object event. Wrapped so that no exception can reach the game.
+              void OnObjectEvent(FWCodeEvent& Event)
+              {
+                  if (!g || g->disabled)
+                      return;
+          #if defined(_MSC_VER)
+                  __try
+                  {
+                      OnObjectEventInner(Event);
+                  }
+                  __except (EXCEPTION_EXECUTE_HANDLER)
+                  {
+                      OnFault();
+                  }
+          #else
                   try
                   {
-                      auto&& args = Event.Arguments();
-                      CInstance* self = std::get<0>(args);
-                      CCode* code = std::get<2>(args);
-                      if (!code)
-                          return;
-
-                      PollKeys();
-
-                      const char* name = CodeName(code);
-                      if (!name || std::strncmp(name, "gml_Object_", 11) != 0)
-                          return;
-                      name += 11; // strip the common prefix
-
-                      bool hit = g->watch_all;
-                      if (!hit)
-                      {
-                          for (const auto& w : g->watch)
-                          {
-                              if (std::strstr(name, w.c_str()) != nullptr)
-                              {
-                                  hit = true;
-                                  break;
-                              }
-                          }
-                      }
-                      if (!hit)
-                          return;
-
-                      double now = NowMs();
-                      if (IsNoisy(name))
-                      {
-                          // Step / Draw events fire every frame: log at most once per second per instance.
-                          char keybuf[300];
-                          std::snprintf(keybuf, sizeof(keybuf), "%s@%p", name, static_cast<const void*>(self));
-                          std::string key(keybuf);
-                          auto it = g->last_noisy.find(key);
-                          if (it != g->last_noisy.end() && now - it->second < 1000.0)
-                              return;
-                          if (g->last_noisy.size() > 4000)
-                              g->last_noisy.clear();
-                          g->last_noisy[key] = now;
-                      }
-                      Write("EVT", name, static_cast<const void*>(self), now);
+                      OnObjectEventInner(Event);
                   }
                   catch (...)
                   {
-                      // never let an exception escape into the game
+                      OnFault();
                   }
+          #endif
+              }
+
+              bool CreateCallbackGuarded(YYTKInterface* y, AurieModule* m, int* out_status)
+              {
+          #if defined(_MSC_VER)
+                  __try
+                  {
+                      *out_status = static_cast<int>(y->CreateCallback(m, EVENT_OBJECT_CALL, reinterpret_cast<PVOID>(&OnObjectEvent), 0));
+                      return true;
+                  }
+                  __except (EXCEPTION_EXECUTE_HANDLER)
+                  {
+                      return false;
+                  }
+          #else
+                  *out_status = static_cast<int>(y->CreateCallback(m, EVENT_OBJECT_CALL, reinterpret_cast<PVOID>(&OnObjectEvent), 0));
+                  return true;
+          #endif
+              }
+
+              // Try to fetch the YYToolkit interface by name through Aurie. Only compiled in if the call is valid for this Aurie version.
+              template <typename TBase>
+              bool TryGetByName(const char* name, TBase*& out, int& status_code)
+              {
+                  if constexpr (requires { ObGetInterface(name, out); })
+                  {
+                      status_code = static_cast<int>(ObGetInterface(name, out));
+                      return status_code == static_cast<int>(AURIE_SUCCESS) && out != nullptr;
+                  }
+                  else
+                  {
+                      status_code = -1;
+                      return false;
+                  }
+              }
+
+              YYTKInterface* AcquireInterface()
+              {
+                  // 1) the documented v5 way
+                  YYTKInterface* iface = YYTK::GetInterface();
+                  Note(iface ? "interface: YYTK::GetInterface() ok" : "interface: YYTK::GetInterface() returned nullptr");
+                  if (iface)
+                      return iface;
+
+                  // 2) by name (the v5 preview registers itself as YYTK_ZeusMain)
+                  static const char* names[] = { "YYTK_ZeusMain", "YYTK_Main" };
+                  for (const char* n : names)
+                  {
+                      AurieInterfaceBase* base = nullptr;
+                      int code = 0;
+                      bool ok = TryGetByName(n, base, code);
+                      std::string text = std::string("interface: ObGetInterface(") + n + ") status=" + std::to_string(code) + (ok ? " ok" : " failed");
+                      Note(text.c_str());
+                      if (ok)
+                          return reinterpret_cast<YYTKInterface*>(base);
+                  }
+                  return nullptr;
               }
 
               void LoadWatch(const std::filesystem::path& dir)
@@ -238,56 +398,6 @@ jobs:
               }
           }
 
-          namespace sl
-          {
-              // Try to fetch the YYToolkit interface by name through Aurie. Only compiled in if the call is valid for this Aurie version.
-              template <typename TBase>
-              bool TryGetByName(const char* name, TBase*& out, int& status_code)
-              {
-                  if constexpr (requires { ObGetInterface(name, out); })
-                  {
-                      status_code = static_cast<int>(ObGetInterface(name, out));
-                      return status_code == static_cast<int>(AURIE_SUCCESS) && out != nullptr;
-                  }
-                  else
-                  {
-                      status_code = -1;
-                      return false;
-                  }
-              }
-
-              YYTKInterface* AcquireInterface()
-              {
-                  auto note = [](const std::string& text)
-                  {
-                      if (g && g->log.is_open())
-                      {
-                          g->log << "# " << text << "\n";
-                          g->log.flush();
-                      }
-                  };
-
-                  // 1) the documented v5 way
-                  YYTKInterface* iface = YYTK::GetInterface();
-                  note(iface ? "interface: YYTK::GetInterface() ok" : "interface: YYTK::GetInterface() returned nullptr");
-                  if (iface)
-                      return iface;
-
-                  // 2) by name (the v5 preview registers itself as YYTK_ZeusMain)
-                  static const char* names[] = { "YYTK_ZeusMain", "YYTK_Main" };
-                  for (const char* n : names)
-                  {
-                      AurieInterfaceBase* base = nullptr;
-                      int code = 0;
-                      bool ok = TryGetByName(n, base, code);
-                      note(std::string("interface: ObGetInterface(") + n + ") status=" + std::to_string(code) + (ok ? " ok" : " failed"));
-                      if (ok)
-                          return reinterpret_cast<YYTKInterface*>(base);
-                  }
-                  return nullptr;
-              }
-          }
-
           EXPORTED AurieStatus ModuleInitialize(
               IN AurieModule* Module,
               IN const std::filesystem::path& ModulePath
@@ -304,42 +414,60 @@ jobs:
               SYSTEMTIME st{};
               GetLocalTime(&st);
               char header[200];
-              std::snprintf(header, sizeof(header), "# session start %04d-%02d-%02d %02d:%02d:%02d, keys: F7 F8 F9 write MARK lines\n",
+              std::snprintf(header, sizeof(header), "# session start %04d-%02d-%02d %02d:%02d:%02d (probe v3), keys: F7 F8 F9 write MARK lines\n",
                   int(st.wYear), int(st.wMonth), int(st.wDay), int(st.wHour), int(st.wMinute), int(st.wSecond));
               if (sl::g->log.is_open())
               {
-                  sl::g->log << header << "# ModuleInitialize entered\n";
+                  sl::g->log << header;
                   sl::g->log.flush();
               }
+              sl::Note("ModuleInitialize entered");
 
               sl::LoadWatch(dir);
 
               YYTKInterface* yytk = sl::AcquireInterface();
               if (!yytk)
               {
-                  if (sl::g->log.is_open())
-                  {
-                      sl::g->log << "# FATAL: could not get the YYToolkit interface\n";
-                      sl::g->log.flush();
-                  }
+                  sl::Note("FATAL: could not get the YYToolkit interface");
                   return AURIE_MODULE_DEPENDENCY_NOT_RESOLVED;
               }
+              sl::Note("calling CreateCallback(EVENT_OBJECT_CALL)");
 
-              AurieStatus status = yytk->CreateCallback(
-                  Module,
-                  EVENT_OBJECT_CALL,
-                  reinterpret_cast<PVOID>(&sl::OnObjectEvent),
-                  0
-              );
-              if (sl::g->log.is_open())
+              int status = -1;
+              if (!sl::CreateCallbackGuarded(yytk, Module, &status))
               {
-                  sl::g->log << "# CreateCallback(EVENT_OBJECT_CALL) status=" << static_cast<int>(status) << "\n";
-                  sl::g->log.flush();
+                  sl::Note("FATAL: access violation inside CreateCallback (interface layout mismatch?)");
+                  return AURIE_MODULE_DEPENDENCY_NOT_RESOLVED;
               }
-              return status;
+              std::string done = "CreateCallback status=" + std::to_string(status);
+              sl::Note(done.c_str());
+              return static_cast<AurieStatus>(status);
           }
           '@
           Set-Content -Path $ex.FullName -Value ($head + $body) -Encoding utf8
+
+      - name: Use the Aurie v2.0.2 headers instead of any older vendored copy
+        shell: pwsh
+        run: |
+          New-Item out -ItemType Directory -Force | Out-Null
+          $cands = @(Get-ChildItem aurie -Recurse -Filter *.hpp | Where-Object { $_.FullName -match '[\\/]Aurie[\\/]shared\.hpp$' })
+          $src = $cands | Where-Object { $_.FullName -notmatch 'Template|VSIX|Example' } | Select-Object -First 1
+          if (-not $src) { $src = $cands | Select-Object -First 1 }
+          if (-not $src) { throw "Aurie shared.hpp was not found in the Aurie v2.0.2 sources" }
+          $srcDir = $src.Directory.FullName
+          $root = $src.Directory.Parent.FullName
+          $log = @("Aurie v2.0.2 shared dir: $srcDir", "include root: $root")
+          $old = @(Get-ChildItem yytk -Recurse -Filter *.hpp | Where-Object { $_.FullName -match '[\\/]Aurie[\\/]shared\.hpp$' })
+          foreach ($t in $old) {
+            $log += "overwriting vendored copy in: $($t.Directory.FullName)"
+            Copy-Item (Join-Path $srcDir '*') $t.Directory.FullName -Recurse -Force
+          }
+          if ($old.Count -eq 0) { $log += "no vendored copy found inside yytk" }
+          $line = 'CL=/I"' + $root + '"'
+          $line | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $log += "env: $line"
+          $log | Out-File out/aurie_header_swap.txt
+          $log | ForEach-Object { Write-Host $_ }
 
       - name: Collect header info (for troubleshooting)
         shell: pwsh
@@ -349,6 +477,7 @@ jobs:
           "commit: $(git -C yytk log -1 --format=%H)" | Out-File $info
           $files = Get-ChildItem yytk/ExamplePlugin, yytk/YYToolkit/source/YYTK/Shared -Recurse -Include *.hpp,*.h,*.cpp -ErrorAction SilentlyContinue
           $files | Select-String -Pattern 'GetInterface|YYTK_Zeus|"YYTK_' | ForEach-Object { "$($_.Path):$($_.LineNumber): $($_.Line.Trim())" } | Out-File $info -Append
+          Get-ChildItem aurie -Recurse -Filter shared.hpp | Select-String -Pattern 'AurieIsDebugBuild' | ForEach-Object { "$($_.Path):$($_.LineNumber): $($_.Line.Trim())" } | Out-File $info -Append
           Get-Content $info | Select-Object -First 40 | Write-Host
 
       - uses: microsoft/setup-msbuild@v2
@@ -358,6 +487,7 @@ jobs:
         run: |
           $start = Get-Date
           New-Item out -ItemType Directory -Force | Out-Null
+          Write-Host "CL env = $env:CL"
           $sln = Get-ChildItem yytk -Filter *.sln -Depth 1 | Select-Object -First 1
           $proj = Get-ChildItem yytk/ExamplePlugin -Filter *.vcxproj -Recurse | Select-Object -First 1
           if (-not $proj) { throw "No ExamplePlugin .vcxproj found" }
@@ -384,6 +514,10 @@ jobs:
           if (-not $main) { throw "Build succeeded but no new DLL was found" }
           Copy-Item $main.FullName out/ShawarmaEvents.dll
           Write-Host "Built: $($main.FullName)"
+          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path out/ShawarmaEvents.dll)))
+          $hasDbg = $text.Contains('__AurieIsDebugBuild')
+          "exports __AurieIsDebugBuild: $hasDbg" | Out-File out/dll_check.txt
+          Write-Host "exports __AurieIsDebugBuild: $hasDbg"
 
       - name: Upload result
         if: always()
