@@ -46,6 +46,35 @@ jobs:
           echo "matrix={\"include\":[$items]}" >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"
 
+      - name: Inspect the official v5.0.0c release files (looking for headers that match the DLL)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release_info
+          gh release view v5.0.0c --repo AurieFramework/YYToolkit --json tagName,name,publishedAt,targetCommitish,assets > release_info/release.json || true
+          cat release_info/release.json || true
+          gh release download v5.0.0c --repo AurieFramework/YYToolkit --dir release_assets || true
+          ls -la release_assets > release_info/assets_list.txt 2>&1 || true
+          cat release_info/assets_list.txt
+          for z in release_assets/*.zip; do
+            [ -f "$z" ] || continue
+            echo "== $z" >> release_info/zip_contents.txt
+            unzip -l "$z" >> release_info/zip_contents.txt 2>&1 || true
+            mkdir -p "release_extract/$(basename "$z" .zip)"
+            unzip -q -o "$z" -d "release_extract/$(basename "$z" .zip)" || true
+          done
+          grep -rn --include="*.hpp" --include="*.h" -E "GetInterface|YYTK_Zeus|\"YYTK_" release_extract > release_info/release_header_lines.txt 2>/dev/null || true
+          head -60 release_info/zip_contents.txt 2>/dev/null || true
+          head -40 release_info/release_header_lines.txt
+
+      - name: Upload release info
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShawarmaEvents-release-info
+          path: release_info
+
   build:
     needs: pick
     runs-on: windows-latest
@@ -585,7 +614,7 @@ jobs:
           for d in all/*/; do
             n=$(basename "$d")
             mkdir -p "result/info/$n"
-            cp "$d"*.txt "result/info/$n"/ 2>/dev/null || true
+            cp "$d"*.txt "$d"*.log "$d"*.json "result/info/$n"/ 2>/dev/null || true
           done
           ls -R result
       - uses: actions/upload-artifact@v4
