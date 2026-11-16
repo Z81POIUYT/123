@@ -1,32 +1,68 @@
-name: Build ShawarmaEvents plugin
+name: Build ShawarmaEvents plugin variants
 
-# Builds the probe plugin in the cloud against YYToolkit v5.0.0c and Aurie v2.0.2 (the versions installed in the game).
-# Runs automatically when this file is committed, and can be re-run from the Actions tab.
+# The installed YYToolkit.dll (built 2026-03-03) does not match the headers at the v5.0.0c tag,
+# so this builds the plugin against several candidate YYToolkit commits (one DLL each).
+# Put ALL the resulting DLLs into mods\Aurie: the ones that do not fit just log an error and unload themselves.
 on:
   push:
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: windows-latest
-    env:
-      _CL_: /std:c++latest
+  pick:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
     steps:
-      - name: Get YYToolkit source (same version as the installed YYToolkit.dll)
+      - id: pick
+        name: Pick candidate YYToolkit commits
         shell: bash
         run: |
           git clone https://github.com/AurieFramework/YYToolkit.git yytk
           cd yytk
-          echo "--- v5 tags:"
-          git tag -l "v5*"
-          if git rev-parse -q --verify "refs/tags/v5.0.0c" > /dev/null; then
-            git checkout -q v5.0.0c
-            echo "Using tag v5.0.0c"
-          else
-            echo "WARNING: tag v5.0.0c not found, using the default branch"
-          fi
+          DEF=$(git remote show origin | sed -n 's/.*HEAD branch: //p')
+          echo "default branch: $DEF"
+          git log -1 --format='tag v5.0.0c: %H %cI %s' v5.0.0c || true
+          BUILT="2026-03-03T16:52:18Z"
+          A=$(git rev-list -n 1 --before="$BUILT" "origin/$DEF" || true)
+          B=$(git log --reverse --format=%H --after="$BUILT" "origin/$DEF" | head -1 || true)
+          HFILES=$(git ls-files | grep -i "YYTK_Shared" || true)
+          C=$(git log --reverse --format=%H -S"YYTK_ZeusMain" "origin/$DEF" -- $HFILES | head -1 || true)
+          D=$(git rev-parse "origin/$DEF")
+          items=""
+          seen=" "
+          add() {
+            local name="$1" sha="$2"
+            if [ -z "$sha" ]; then return; fi
+            case "$seen" in *" $sha "*) return;; esac
+            seen="$seen$sha "
+            items="$items{\"name\":\"${name}_${sha:0:7}\",\"ref\":\"$sha\"},"
+            git log -1 --format="candidate $name: %H %cI %s" "$sha"
+          }
+          add before "$A"
+          add after "$B"
+          add zeusmain "$C"
+          add head "$D"
+          items="${items%,}"
+          echo "matrix={\"include\":[$items]}" >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+  build:
+    needs: pick
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.pick.outputs.matrix) }}
+    env:
+      _CL_: /std:c++latest
+    steps:
+      - name: Get YYToolkit source (${{ matrix.name }})
+        shell: bash
+        run: |
+          git clone https://github.com/AurieFramework/YYToolkit.git yytk
+          cd yytk
+          git checkout -q ${{ matrix.ref }}
           git submodule update --init --recursive || true
-          git log -1 --oneline
+          git log -1 --format="%H %cI %s"
           ls -la
           ls -la ExamplePlugin
 
@@ -409,13 +445,14 @@ jobs:
 
               // Open the log first, so that we can always see what happened (even when something fails below).
               std::filesystem::path dir = ModulePath.parent_path();
-              sl::g->log.open(dir / "shawarma_events.log", std::ios::app);
+              std::string stem = ModulePath.stem().string(); // each DLL variant writes its own <dll name>.log
+              sl::g->log.open(dir / (stem + ".log"), std::ios::app);
 
               SYSTEMTIME st{};
               GetLocalTime(&st);
-              char header[200];
-              std::snprintf(header, sizeof(header), "# session start %04d-%02d-%02d %02d:%02d:%02d (probe v3), keys: F7 F8 F9 write MARK lines\n",
-                  int(st.wYear), int(st.wMonth), int(st.wDay), int(st.wHour), int(st.wMinute), int(st.wSecond));
+              char header[400];
+              std::snprintf(header, sizeof(header), "# session start %04d-%02d-%02d %02d:%02d:%02d (probe v4: %s), keys: F7 F8 F9 write MARK lines\n",
+                  int(st.wYear), int(st.wMonth), int(st.wDay), int(st.wHour), int(st.wMinute), int(st.wSecond), stem.c_str());
               if (sl::g->log.is_open())
               {
                   sl::g->log << header;
@@ -474,10 +511,14 @@ jobs:
         run: |
           New-Item out -ItemType Directory -Force | Out-Null
           $info = "out/header_info.txt"
-          "commit: $(git -C yytk log -1 --format=%H)" | Out-File $info
+          "variant: ${{ matrix.name }}  commit: $(git -C yytk log -1 --format='%H %cI')" | Out-File $info
           $files = Get-ChildItem yytk/ExamplePlugin, yytk/YYToolkit/source/YYTK/Shared -Recurse -Include *.hpp,*.h,*.cpp -ErrorAction SilentlyContinue
           $files | Select-String -Pattern 'GetInterface|YYTK_Zeus|"YYTK_' | ForEach-Object { "$($_.Path):$($_.LineNumber): $($_.Line.Trim())" } | Out-File $info -Append
-          Get-ChildItem aurie -Recurse -Filter shared.hpp | Select-String -Pattern 'AurieIsDebugBuild' | ForEach-Object { "$($_.Path):$($_.LineNumber): $($_.Line.Trim())" } | Out-File $info -Append
+          $ih = Get-ChildItem yytk -Recurse -Filter YYTK_Shared_Interface.hpp | Select-Object -First 1
+          if ($ih) {
+            $n = @(Select-String -Path $ih.FullName -Pattern '^\s*virtual\s').Count
+            "virtual lines in $($ih.Name): $n (the installed DLL has 33 vtable entries in total)" | Out-File $info -Append
+          }
           Get-Content $info | Select-Object -First 40 | Write-Host
 
       - uses: microsoft/setup-msbuild@v2
@@ -512,9 +553,10 @@ jobs:
           $main = $dlls | Where-Object { $_.FullName -match 'ExamplePlugin' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $main) { $main = $dlls | Sort-Object LastWriteTime -Descending | Select-Object -First 1 }
           if (-not $main) { throw "Build succeeded but no new DLL was found" }
-          Copy-Item $main.FullName out/ShawarmaEvents.dll
-          Write-Host "Built: $($main.FullName)"
-          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path out/ShawarmaEvents.dll)))
+          $outdll = "out/ShawarmaEvents_${{ matrix.name }}.dll"
+          Copy-Item $main.FullName $outdll
+          Write-Host "Built: $($main.FullName) -> $outdll"
+          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path $outdll)))
           $hasDbg = $text.Contains('__AurieIsDebugBuild')
           "exports __AurieIsDebugBuild: $hasDbg" | Out-File out/dll_check.txt
           Write-Host "exports __AurieIsDebugBuild: $hasDbg"
@@ -523,5 +565,30 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ShawarmaEvents
+          name: ShawarmaEvents-${{ matrix.name }}
           path: out
+
+  collect:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ShawarmaEvents-*
+          path: all
+      - name: Gather all DLLs into one folder
+        shell: bash
+        run: |
+          mkdir -p result/info
+          find all -name '*.dll' -exec cp {} result/ \;
+          for d in all/*/; do
+            n=$(basename "$d")
+            mkdir -p "result/info/$n"
+            cp "$d"*.txt "result/info/$n"/ 2>/dev/null || true
+          done
+          ls -R result
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShawarmaEvents-ALL
+          path: result
