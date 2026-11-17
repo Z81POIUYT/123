@@ -1,8 +1,7 @@
 name: Build ShawarmaEvents plugin variants
 
-# The installed YYToolkit.dll (built 2026-03-03) does not match the headers at the v5.0.0c tag,
-# so this builds the plugin against several candidate YYToolkit commits (one DLL each).
-# Put ALL the resulting DLLs into mods\Aurie: the ones that do not fit just log an error and unload themselves.
+# Builds the probe plugin (v5). The plugin talks to YYToolkit through the interface layout read from the PDB
+# of the installed YYToolkit.dll, so it does not depend on the YYToolkit headers matching the DLL.
 on:
   push:
   workflow_dispatch:
@@ -46,35 +45,6 @@ jobs:
           echo "matrix={\"include\":[$items]}" >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"
 
-      - name: Inspect the official v5.0.0c release files (looking for headers that match the DLL)
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p release_info
-          gh release view v5.0.0c --repo AurieFramework/YYToolkit --json tagName,name,publishedAt,targetCommitish,assets > release_info/release.json || true
-          cat release_info/release.json || true
-          gh release download v5.0.0c --repo AurieFramework/YYToolkit --dir release_assets || true
-          ls -la release_assets > release_info/assets_list.txt 2>&1 || true
-          cat release_info/assets_list.txt
-          for z in release_assets/*.zip; do
-            [ -f "$z" ] || continue
-            echo "== $z" >> release_info/zip_contents.txt
-            unzip -l "$z" >> release_info/zip_contents.txt 2>&1 || true
-            mkdir -p "release_extract/$(basename "$z" .zip)"
-            unzip -q -o "$z" -d "release_extract/$(basename "$z" .zip)" || true
-          done
-          grep -rn --include="*.hpp" --include="*.h" -E "GetInterface|YYTK_Zeus|\"YYTK_" release_extract > release_info/release_header_lines.txt 2>/dev/null || true
-          head -60 release_info/zip_contents.txt 2>/dev/null || true
-          head -40 release_info/release_header_lines.txt
-
-      - name: Upload release info
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ShawarmaEvents-release-info
-          path: release_info
-
   build:
     needs: pick
     runs-on: windows-latest
@@ -117,9 +87,15 @@ jobs:
           $head | ForEach-Object { Write-Host $_ }
           $body = @'
           // ======================================================================
-          // Shawarma Legend event probe (YYToolkit v5 plugin), v3. ASCII only on purpose.
-          // Logs object events (Create / Alarm / Other / Step ...) of the objects listed in
-          // shawarma_watch.txt, plus F7 / F8 / F9 key marks, to shawarma_events.log.
+          // Shawarma Legend event probe (YYToolkit v5 plugin), v5. ASCII only on purpose.
+          // This version does NOT use the YYToolkit C++ headers for the interface: the interface layout was
+          // read from the PDB that belongs to the installed YYToolkit.dll (v5.0.0c):
+          //   YYTKInterface vtable: slot 8 (offset 64) = CreateCallback(AurieModule*, EventTriggers, void*, int)
+          //   EVENT_OBJECT_CALL = 1
+          //   event object passed to the callback = FunctionWrapper, first member = std::tuple (MSVC stores the
+          //   elements in reverse order): +0 int, +8 RValue* result, +16 CCode*, +24 CInstance* other, +32 CInstance* self
+          //   CCode::m_Name (const char*) at +128
+          // Logs object events of the objects listed in shawarma_watch.txt, plus F7 / F8 / F9 key marks.
           // ======================================================================
           #if __has_include(<Windows.h>)
           #include <Windows.h>
@@ -130,16 +106,20 @@ jobs:
           #include <filesystem>
           #include <fstream>
           #include <string>
-          #include <tuple>
           #include <unordered_map>
           #include <unordered_set>
           #include <vector>
 
           using namespace Aurie;
-          using namespace YYTK;
 
           namespace sl
           {
+              constexpr unsigned kEventObjectCall = 1;   // YYTK::EVENT_OBJECT_CALL
+              constexpr int kCreateCallbackSlot = 8;     // vtable offset 64 / 8
+              constexpr size_t kOffSelf = 32;            // CInstance* self  inside the event tuple
+              constexpr size_t kOffCode = 16;            // CCode*     code  inside the event tuple
+              constexpr size_t kOffCodeName = 128;       // const char* m_Name inside CCode
+
               struct State
               {
                   std::ofstream log;
@@ -187,21 +167,10 @@ jobs:
                   }
               }
 
-              // The code-entry name accessor differs between YYToolkit versions: detect it at compile time.
-              template <typename T>
-              const char* CodeName(T* code)
+              // Reads the event name out of the CCode object. Plain function (no C++ objects) so it can sit under SEH.
+              bool CopyNameUnsafe(const void* code, char* out, size_t cap)
               {
-                  if constexpr (requires { code->GetName(); })
-                      return code->GetName();
-                  else if constexpr (requires { code->i_pName; })
-                      return code->i_pName;
-                  else
-                      return nullptr;
-              }
-
-              bool CopyNameUnsafe(CCode* code, char* out, size_t cap)
-              {
-                  const char* n = CodeName(code);
+                  const char* n = *reinterpret_cast<const char* const*>(static_cast<const unsigned char*>(code) + kOffCodeName);
                   if (!n)
                       return false;
                   size_t i = 0;
@@ -211,8 +180,7 @@ jobs:
                   return true;
               }
 
-              // Copies the code name into a local buffer. A bad pointer must never take the game down.
-              bool CopyName(CCode* code, char* out, size_t cap)
+              bool CopyName(const void* code, char* out, size_t cap)
               {
           #if defined(_MSC_VER)
                   __try
@@ -251,11 +219,11 @@ jobs:
                   }
               }
 
-              void OnObjectEventInner(FWCodeEvent& Event)
+              void OnObjectEventInner(void* Event)
               {
-                  auto&& args = Event.Arguments();
-                  CInstance* self = std::get<0>(args);
-                  CCode* code = std::get<2>(args);
+                  const unsigned char* ev = static_cast<const unsigned char*>(Event);
+                  const void* self = *reinterpret_cast<const void* const*>(ev + kOffSelf);
+                  const void* code = *reinterpret_cast<const void* const*>(ev + kOffCode);
                   if (!code)
                       return;
 
@@ -276,7 +244,7 @@ jobs:
                   }
 
                   if (g->raw_seen.size() < 80 && g->raw_seen.insert(namebuf).second)
-                      Write("RAW", namebuf, static_cast<const void*>(self), NowMs());
+                      Write("RAW", namebuf, self, NowMs());
 
                   if (std::strncmp(namebuf, "gml_Object_", 11) != 0)
                       return;
@@ -302,7 +270,7 @@ jobs:
                   {
                       // Step / Draw events fire every frame: log at most once per second per instance.
                       char keybuf[300];
-                      std::snprintf(keybuf, sizeof(keybuf), "%s@%p", name, static_cast<const void*>(self));
+                      std::snprintf(keybuf, sizeof(keybuf), "%s@%p", name, self);
                       std::string key(keybuf);
                       auto it = g->last_noisy.find(key);
                       if (it != g->last_noisy.end() && now - it->second < 1000.0)
@@ -312,7 +280,7 @@ jobs:
                       g->last_noisy[key] = now;
                   }
                   g->events_logged++;
-                  Write("EVT", name, static_cast<const void*>(self), now);
+                  Write("EVT", name, self, now);
               }
 
               void OnFault()
@@ -330,10 +298,10 @@ jobs:
                   }
               }
 
-              // Entry point called by YYToolkit for every object event. Wrapped so that no exception can reach the game.
-              void OnObjectEvent(FWCodeEvent& Event)
+              // Entry point called by YYToolkit for every object event (it passes a reference to its event wrapper).
+              void OnObjectEvent(void* Event)
               {
-                  if (!g || g->disabled)
+                  if (!g || g->disabled || !Event)
                       return;
           #if defined(_MSC_VER)
                   __try
@@ -356,12 +324,30 @@ jobs:
           #endif
               }
 
-              bool CreateCallbackGuarded(YYTKInterface* y, AurieModule* m, int* out_status)
+              bool IsExecutableAddress(const void* p)
               {
+          #if defined(_WIN32)
+                  MEMORY_BASIC_INFORMATION mbi{};
+                  if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0)
+                      return false;
+                  const DWORD exec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+                  return mbi.State == MEM_COMMIT && (mbi.Protect & exec) != 0;
+          #else
+                  return p != nullptr;
+          #endif
+              }
+
+              using CreateCallbackFn = AurieStatus(*)(void* self, AurieModule* module, unsigned int trigger, void* routine, int priority);
+
+              // Calls YYTKInterface::CreateCallback through the vtable (x64: "this" is the first argument).
+              bool CreateCallbackGuarded(void* iface, AurieModule* m, int* out_status)
+              {
+                  void** vtbl = *reinterpret_cast<void***>(iface);
+                  CreateCallbackFn fn = reinterpret_cast<CreateCallbackFn>(vtbl[kCreateCallbackSlot]);
           #if defined(_MSC_VER)
                   __try
                   {
-                      *out_status = static_cast<int>(y->CreateCallback(m, EVENT_OBJECT_CALL, reinterpret_cast<PVOID>(&OnObjectEvent), 0));
+                      *out_status = static_cast<int>(fn(iface, m, kEventObjectCall, reinterpret_cast<void*>(&OnObjectEvent), 0));
                       return true;
                   }
                   __except (EXCEPTION_EXECUTE_HANDLER)
@@ -369,12 +355,12 @@ jobs:
                       return false;
                   }
           #else
-                  *out_status = static_cast<int>(y->CreateCallback(m, EVENT_OBJECT_CALL, reinterpret_cast<PVOID>(&OnObjectEvent), 0));
+                  *out_status = static_cast<int>(fn(iface, m, kEventObjectCall, reinterpret_cast<void*>(&OnObjectEvent), 0));
                   return true;
           #endif
               }
 
-              // Try to fetch the YYToolkit interface by name through Aurie. Only compiled in if the call is valid for this Aurie version.
+              // Fetch an interface by name through Aurie. Only compiled in if the call is valid for this Aurie version.
               template <typename TBase>
               bool TryGetByName(const char* name, TBase*& out, int& status_code)
               {
@@ -388,29 +374,6 @@ jobs:
                       status_code = -1;
                       return false;
                   }
-              }
-
-              YYTKInterface* AcquireInterface()
-              {
-                  // 1) the documented v5 way
-                  YYTKInterface* iface = YYTK::GetInterface();
-                  Note(iface ? "interface: YYTK::GetInterface() ok" : "interface: YYTK::GetInterface() returned nullptr");
-                  if (iface)
-                      return iface;
-
-                  // 2) by name (the v5 preview registers itself as YYTK_ZeusMain)
-                  static const char* names[] = { "YYTK_ZeusMain", "YYTK_Main" };
-                  for (const char* n : names)
-                  {
-                      AurieInterfaceBase* base = nullptr;
-                      int code = 0;
-                      bool ok = TryGetByName(n, base, code);
-                      std::string text = std::string("interface: ObGetInterface(") + n + ") status=" + std::to_string(code) + (ok ? " ok" : " failed");
-                      Note(text.c_str());
-                      if (ok)
-                          return reinterpret_cast<YYTKInterface*>(base);
-                  }
-                  return nullptr;
               }
 
               void LoadWatch(const std::filesystem::path& dir)
@@ -480,7 +443,7 @@ jobs:
               SYSTEMTIME st{};
               GetLocalTime(&st);
               char header[400];
-              std::snprintf(header, sizeof(header), "# session start %04d-%02d-%02d %02d:%02d:%02d (probe v4: %s), keys: F7 F8 F9 write MARK lines\n",
+              std::snprintf(header, sizeof(header), "# session start %04d-%02d-%02d %02d:%02d:%02d (probe v5: %s), keys: F7 F8 F9 write MARK lines\n",
                   int(st.wYear), int(st.wMonth), int(st.wDay), int(st.wHour), int(st.wMinute), int(st.wSecond), stem.c_str());
               if (sl::g->log.is_open())
               {
@@ -491,18 +454,33 @@ jobs:
 
               sl::LoadWatch(dir);
 
-              YYTKInterface* yytk = sl::AcquireInterface();
-              if (!yytk)
+              AurieInterfaceBase* base = nullptr;
+              int code = 0;
+              bool ok = sl::TryGetByName("YYTK_ZeusMain", base, code);
+              std::string text = "interface: ObGetInterface(YYTK_ZeusMain) status=" + std::to_string(code) + (ok ? " ok" : " failed");
+              sl::Note(text.c_str());
+              if (!ok)
               {
                   sl::Note("FATAL: could not get the YYToolkit interface");
+                  return AURIE_MODULE_DEPENDENCY_NOT_RESOLVED;
+              }
+
+              void** vtbl = *reinterpret_cast<void***>(base);
+              char vt[160];
+              std::snprintf(vt, sizeof(vt), "interface at %p, vtable %p, CreateCallback slot %d -> %p", static_cast<void*>(base), static_cast<void*>(vtbl),
+                  sl::kCreateCallbackSlot, vtbl ? vtbl[sl::kCreateCallbackSlot] : nullptr);
+              sl::Note(vt);
+              if (!vtbl || !sl::IsExecutableAddress(vtbl[sl::kCreateCallbackSlot]))
+              {
+                  sl::Note("FATAL: vtable slot does not point to executable code");
                   return AURIE_MODULE_DEPENDENCY_NOT_RESOLVED;
               }
               sl::Note("calling CreateCallback(EVENT_OBJECT_CALL)");
 
               int status = -1;
-              if (!sl::CreateCallbackGuarded(yytk, Module, &status))
+              if (!sl::CreateCallbackGuarded(base, Module, &status))
               {
-                  sl::Note("FATAL: access violation inside CreateCallback (interface layout mismatch?)");
+                  sl::Note("FATAL: access violation inside CreateCallback");
                   return AURIE_MODULE_DEPENDENCY_NOT_RESOLVED;
               }
               std::string done = "CreateCallback status=" + std::to_string(status);
@@ -596,50 +574,6 @@ jobs:
         with:
           name: ShawarmaEvents-${{ matrix.name }}
           path: out
-
-  pdb:
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Download the PDB (debug symbols) that belongs to the installed YYToolkit.dll
-        shell: bash
-        run: |
-          mkdir -p pdb pdb_info
-          gh release download v5.0.0c --repo AurieFramework/YYToolkit --pattern "YYToolkit.pdb" --dir pdb
-          ls -la pdb
-
-      - name: Install LLVM tools
-        shell: bash
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq llvm
-          ls -la /usr/lib/llvm-*/bin/llvm-pdbutil || true
-
-      - name: Dump the real interface layout from the PDB
-        shell: bash
-        run: |
-          T=$(ls /usr/lib/llvm-*/bin/llvm-pdbutil 2>/dev/null | tail -1)
-          echo "tool: $T" | tee pdb_info/tool_info.txt
-          "$T" dump -types pdb/YYToolkit.pdb > types_all.txt 2> pdb_info/dump_stderr.txt || true
-          ls -la types_all.txt | tee -a pdb_info/tool_info.txt
-          wc -l types_all.txt | tee -a pdb_info/tool_info.txt
-          {
-            for pat in 'name = `CreateCallback`' 'EVENT_OBJECT_CALL' 'FWCodeEvent' 'YYTK::CCode`' 'YYTK::YYTKInterface`' 'AurieInterfaceBase`'; do
-              echo "################ $pat"
-              grep -n -F -m 3 -B 70 -A 70 -- "$pat" types_all.txt | head -450
-            done
-          } > pdb_info/pdb_grep.txt 2>&1 || true
-          "$T" pretty -classes -enums -class-definitions=all -include='YYTKInterface|FWCodeEvent|CCode$|EventTriggers|AurieInterfaceBase' pdb/YYToolkit.pdb > pdb_info/pdb_pretty.txt 2>&1 || true
-          gzip -9 -c types_all.txt > pdb_info/types_all.txt.gz || true
-          ls -la pdb_info
-
-      - name: Upload PDB info
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ShawarmaEvents-pdb-info
-          path: pdb_info
 
   collect:
     needs: build
